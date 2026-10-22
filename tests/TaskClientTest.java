@@ -3,6 +3,7 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.rmi.ConnectException;
 import java.rmi.RemoteException;
 import java.time.LocalDate;
 import java.util.ArrayList;
@@ -38,6 +39,7 @@ public final class TaskClientTest {
             testSnapshotFailureAfterSuccessfulMutation();
             testCloseFromCallbacks();
         });
+        testConnectionFailureDiagnostics();
         testValidationErrorsKeepConnection();
         testCloseSuppressesLateCallbacks();
         testActionsRequireEventThread();
@@ -422,7 +424,67 @@ public final class TaskClientTest {
         }
     }
 
+    private static void testConnectionFailureDiagnostics() throws Exception {
+        Harness unavailable = new Harness(() -> {
+            throw new ConnectException("Connection refused: 127.0.0.1",
+                    new java.net.ConnectException("Connection refused"));
+        });
+        try {
+            String error = withExpectedErrors(() ->
+                    unavailable.perform(unavailable.connection::refresh).expectFailure(false, "Refresh"));
+            checkConnectionRefusedMessage(error);
+            assertDisconnectedRejectsMutations(unavailable);
+        } finally {
+            unavailable.close();
+        }
+
+        FakeService service = new FakeService("Existing");
+        Harness polling = new Harness(() -> service);
+        try {
+            polling.perform(polling.connection::refresh).expectTasks("Existing");
+            service.beforeRead = () -> {
+                throw new ConnectException("Connection refused: 127.0.0.1");
+            };
+            String error = withExpectedErrors(() -> {
+                Request failed = polling.perform(polling.connection::refreshAutomatically);
+                check(!failed.connected && failed.tasks == null && failed.error == null,
+                        "A refused automatic refresh must disconnect without opening an error dialog.");
+            });
+            checkConnectionRefusedMessage(error);
+            assertDisconnectedRejectsMutations(polling);
+        } finally {
+            polling.close();
+        }
+
+        Harness unexpected = new Harness(() -> {
+            throw new RemoteException("Unexpected RMI failure", new IllegalStateException("Diagnostic detail"));
+        });
+        try {
+            String error = withExpectedErrors(() ->
+                    unexpected.perform(unexpected.connection::refresh).expectFailure(false, "Refresh"));
+            check(error.contains("java.rmi.RemoteException: Unexpected RMI failure")
+                            && error.contains("Caused by: java.lang.IllegalStateException: Diagnostic detail")
+                            && error.contains("\tat "),
+                    "Unexpected remote errors must retain their complete exception diagnostics.");
+        } finally {
+            unexpected.close();
+        }
+    }
+
+    private static void checkConnectionRefusedMessage(String error) {
+        check(error.lines().count() == 1 && error.contains("connection refused")
+                        && error.contains("server") && error.contains("Refresh") && !error.contains("\tat "),
+                "An unavailable server must produce one actionable console line rather than a stack trace.");
+    }
+
     private static void testCloseSuppressesLateCallbacks() throws Exception {
+        for (boolean lateFailure : new boolean[] {false, true}) {
+            String error = withExpectedErrors(() -> testCloseSuppressesLateCallbacks(lateFailure));
+            check(error.isEmpty(), "Closing a client must suppress late connection errors as well as callbacks.");
+        }
+    }
+
+    private static void testCloseSuppressesLateCallbacks(boolean lateFailure) throws Exception {
         FakeService service = new FakeService();
         CountDownLatch entered = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
@@ -432,6 +494,9 @@ public final class TaskClientTest {
             entered.countDown();
             try {
                 awaitIgnoringInterrupts(release);
+                if (lateFailure) {
+                    throw new ConnectException("Connection refused after the client closed");
+                }
                 return service;
             } finally {
                 exited.countDown();
@@ -632,7 +697,7 @@ public final class TaskClientTest {
         check(!SwingUtilities.isEventDispatchThread(), "Connector and remote calls must run outside the Swing thread.");
     }
 
-    private static void withExpectedErrors(CheckedTest test) throws Exception {
+    private static String withExpectedErrors(CheckedTest test) throws Exception {
         PrintStream previous = System.err;
         ByteArrayOutputStream captured = new ByteArrayOutputStream();
         try (PrintStream output = new PrintStream(captured, true, StandardCharsets.UTF_8.name())) {
@@ -646,6 +711,7 @@ public final class TaskClientTest {
                 System.setErr(previous);
             }
         }
+        return new String(captured.toByteArray(), StandardCharsets.UTF_8);
     }
 
     private static <T> T onEventThread(java.util.concurrent.Callable<T> action) throws Exception {

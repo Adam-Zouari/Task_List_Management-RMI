@@ -1,4 +1,5 @@
 import java.time.LocalDate;
+import java.rmi.ConnectException;
 import java.rmi.RemoteException;
 import java.util.ArrayList;
 import java.util.concurrent.CancellationException;
@@ -141,7 +142,12 @@ final class TaskClientConnection implements AutoCloseable {
 
     private void fail(Throwable cause, boolean automatic, String message) {
         service = null;
-        cause.printStackTrace(System.err);
+        if (cause instanceof ConnectException) {
+            System.err.println("TaskManager connection refused. Check that the server is running "
+                    + "and the host/ports are correct, then use Refresh.");
+        } else {
+            cause.printStackTrace(System.err);
+        }
         if (!automatic) {
             listener.failed(message);
         }
