@@ -14,14 +14,14 @@ fi
 
 mkdir -p out
 if [ "$test_mode" = true ]; then
-    javac --release 11 -Xlint:all -Werror -d out ./*.java ./tests/*.java
+    javac --release 11 -Xlint:all -Werror -d out ./src/*.java ./tests/*.java
 else
-    javac --release 11 -Xlint:all -Werror -d out ./*.java
+    javac --release 11 -Xlint:all -Werror -d out ./src/*.java
 fi
 echo 'Build complete: compiled classes are in out/.'
 
 if [ "$test_mode" = true ]; then
-    for test_class in TaskManagerImplTest TaskIntegrationTest TaskClientTest TaskTransportTest; do
+    for test_class in TaskManagerImplTest TaskStoreTest TaskIntegrationTest TaskClientTest TaskTableModelTest TaskTransportTest; do
         java -Djava.awt.headless=true -cp out "$test_class"
     done
 fi

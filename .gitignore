@@ -1,5 +1,6 @@
 /out/
 /out-audit/
+/data/
 *.class
 *.log
 .idea/

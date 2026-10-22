@@ -1,3 +1,5 @@
+import java.time.LocalDate;
+import java.rmi.RemoteException;
 import java.util.ArrayList;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
@@ -8,7 +10,7 @@ import javax.swing.SwingWorker;
 final class TaskClientConnection implements AutoCloseable {
     interface Listener {
         void started(String description);
-        void tasksReceived(ArrayList<String> tasks);
+        void tasksReceived(ArrayList<Task> tasks);
         void failed(String message);
         void finished(boolean connected);
     }
@@ -18,21 +20,15 @@ final class TaskClientConnection implements AutoCloseable {
         TaskManager connect() throws Exception;
     }
 
-    private enum Operation {
-        REFRESH("Refreshing tasks..."), ADD("Adding task..."), REMOVE("Removing task..."),
-        CLEAR("Deleting all tasks...");
-
-        private final String description;
-
-        Operation(String description) {
-            this.description = description;
-        }
+    @FunctionalInterface
+    private interface RemoteAction {
+        void run(TaskManager service) throws RemoteException;
     }
 
     private final Connector connector;
     private final Listener listener;
     private TaskManager service;
-    private SwingWorker<ArrayList<String>, Void> worker;
+    private SwingWorker<ArrayList<Task>, Void> worker;
     private boolean closed;
 
     TaskClientConnection(String host, int port, Listener listener) {
@@ -45,54 +41,59 @@ final class TaskClientConnection implements AutoCloseable {
     }
 
     boolean refresh() {
-        return submit(Operation.REFRESH, null);
+        return submit("Refreshing tasks...", true, false, null);
     }
 
-    boolean add(String task) {
-        return submit(Operation.ADD, task);
+    /** Poll the current service quietly; only a manual refresh may reconnect. */
+    boolean refreshAutomatically() {
+        return submit("Synchronizing tasks...", false, true, null);
     }
 
-    boolean remove(String task) {
-        return submit(Operation.REMOVE, task);
+    boolean add(String description, LocalDate dueDate) {
+        return mutate("Adding task...", service -> service.addTask(description, dueDate));
+    }
+
+    boolean update(String id, String description, LocalDate dueDate) {
+        return mutate("Updating task...", service -> service.updateTask(id, description, dueDate));
+    }
+
+    boolean setCompleted(String id, boolean completed) {
+        return mutate("Updating completion...", service -> service.setTaskCompleted(id, completed));
+    }
+
+    boolean remove(String id) {
+        return mutate("Removing task...", service -> service.removeTask(id));
     }
 
     boolean clear() {
-        return submit(Operation.CLEAR, null);
+        return mutate("Deleting all tasks...", TaskManager::clearTasks);
     }
 
-    private boolean submit(Operation operation, String task) {
+    private boolean mutate(String description, RemoteAction mutation) {
+        return submit(description, false, false, mutation);
+    }
+
+    private boolean submit(String description, boolean lookupService, boolean automatic, RemoteAction mutation) {
         requireEventThread();
-        if (closed || worker != null || (operation != Operation.REFRESH && service == null)) {
+        if (closed || worker != null || (!lookupService && service == null)) {
             return false;
         }
         TaskManager previousService = service;
-        SwingWorker<ArrayList<String>, Void> request = new SwingWorker<ArrayList<String>, Void>() {
+        SwingWorker<ArrayList<Task>, Void> request = new SwingWorker<ArrayList<Task>, Void>() {
             private TaskManager currentService;
             private boolean mutationAttempted;
             private boolean mutationCompleted;
 
             @Override
-            protected ArrayList<String> doInBackground() throws Exception {
-                // Refresh always looks up a fresh stub, allowing recovery after a server restart.
-                currentService = operation == Operation.REFRESH ? connector.connect() : previousService;
-                if (operation != Operation.REFRESH) {
+            protected ArrayList<Task> doInBackground() throws Exception {
+                // Manual refresh looks up a fresh stub; polling never reconnects automatically.
+                currentService = lookupService ? connector.connect() : previousService;
+                if (mutation != null) {
                     mutationAttempted = true;
-                    switch (operation) {
-                        case ADD:
-                            currentService.addTask(task);
-                            break;
-                        case REMOVE:
-                            currentService.removeTask(task);
-                            break;
-                        case CLEAR:
-                            currentService.clearTasks();
-                            break;
-                        default:
-                            throw new IllegalStateException("Unknown task operation.");
-                    }
+                    mutation.run(currentService);
                     mutationCompleted = true;
                 }
-                // Never patch the local list: other clients may have changed the server state.
+                // Other clients may have changed the list during any operation.
                 return currentService.getAllTasks();
             }
 
@@ -102,16 +103,14 @@ final class TaskClientConnection implements AutoCloseable {
                     return;
                 }
                 try {
-                    ArrayList<String> tasks = get();
+                    ArrayList<Task> tasks = get();
                     service = currentService;
                     listener.tasksReceived(tasks);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    service = null;
-                    listener.failed("The request was interrupted. Refresh to reconnect before continuing.");
+                    fail(e, automatic, "The request was interrupted. Refresh to reconnect before continuing.");
                 } catch (CancellationException e) {
-                    service = null;
-                    listener.failed("The request was cancelled. Refresh before continuing.");
+                    fail(e, automatic, "The request was cancelled. Refresh before continuing.");
                 } catch (ExecutionException e) {
                     Throwable cause = e.getCause();
                     if (mutationAttempted && !mutationCompleted
@@ -119,12 +118,10 @@ final class TaskClientConnection implements AutoCloseable {
                         service = currentService;
                         listener.failed("Task rejected: " + cause.getMessage());
                     } else {
-                        service = null;
-                        cause.printStackTrace(System.err);
                         String outcome = mutationAttempted
                                 ? " The change may already have been applied. Refresh and check the list before trying again."
                                 : " Start the server or check the connection, then use Refresh to reconnect.";
-                        listener.failed("Could not contact TaskManager." + outcome);
+                        fail(cause, automatic, "Could not contact TaskManager." + outcome);
                     }
                 } finally {
                     worker = null;
@@ -135,11 +132,19 @@ final class TaskClientConnection implements AutoCloseable {
             }
         };
         worker = request;
-        listener.started(operation.description);
+        listener.started(description);
         if (!closed) {
             request.execute();
         }
         return true;
+    }
+
+    private void fail(Throwable cause, boolean automatic, String message) {
+        service = null;
+        cause.printStackTrace(System.err);
+        if (!automatic) {
+            listener.failed(message);
+        }
     }
 
     @Override

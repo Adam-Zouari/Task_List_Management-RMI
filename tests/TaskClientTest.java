@@ -4,9 +4,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.rmi.RemoteException;
+import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
@@ -29,8 +31,10 @@ public final class TaskClientTest {
         testBackgroundRequestsAndAuthoritativeSnapshots();
         testSlowRequestsKeepEventThreadResponsive();
         withExpectedErrors(() -> {
+            testAutomaticRefresh();
             testReconnectAfterFailureAndRestart();
             testUncertainMutationIsNeverRetried();
+            testPersistenceFailureBeforeMutation();
             testSnapshotFailureAfterSuccessfulMutation();
             testCloseFromCallbacks();
         });
@@ -51,9 +55,12 @@ public final class TaskClientTest {
         });
         try {
             onEventThread(() -> {
-                check(!client.connection.add("Too early"), "Add must be disabled before connecting.");
+                check(!client.connection.add("Too early", null), "Add must be disabled before connecting.");
+                check(!client.connection.update("id", "Too early", null), "Edit must be disabled before connecting.");
+                check(!client.connection.setCompleted("id", true), "Completion must be disabled before connecting.");
                 check(!client.connection.remove("Existing"), "Remove must be disabled before connecting.");
                 check(!client.connection.clear(), "Clear must be disabled before connecting.");
+                check(!client.connection.refreshAutomatically(), "Polling must be disabled before connecting.");
                 return null;
             });
             Request first = client.perform(client.connection::refresh);
@@ -62,14 +69,50 @@ public final class TaskClientTest {
 
             service.calls.clear();
             service.afterAdd = () -> service.inject("Other client's task");
-            client.perform(() -> client.connection.add("New")).expectTasks("Existing", "New", "Other client's task");
+            LocalDate dueDate = LocalDate.of(2030, 4, 12);
+            Request added = client.perform(() -> client.connection.add("New", dueDate));
+            added.expectTasks("Existing", "New", "Other client's task");
+            Task addedTask = added.tasks.get(1);
+            check(dueDate.equals(addedTask.getDueDate()) && !addedTask.isCompleted(),
+                    "Add must forward its due date and receive the server-assigned identity.");
             check(service.calls.equals(Arrays.asList("add", "read")),
                     "Add must be followed by an authoritative full-list fetch.");
 
             service.calls.clear();
+            LocalDate updatedDate = dueDate.plusDays(1);
+            service.afterUpdate = () -> service.inject("Concurrent edit addition");
+            Request edited = client.perform(() -> client.connection.update(addedTask.getId(), "Edited", updatedDate));
+            edited.expectTasks("Existing", "Edited", "Other client's task", "Concurrent edit addition");
+            check(service.calls.equals(Arrays.asList("update", "read")),
+                    "Editing must be followed by an authoritative snapshot.");
+            check(addedTask.getId().equals(edited.tasks.get(1).getId())
+                            && updatedDate.equals(edited.tasks.get(1).getDueDate()),
+                    "Editing must forward the selected task identity and new due date.");
+
+            service.calls.clear();
+            service.afterCompleted = () -> service.inject("Concurrent completion addition");
+            Request completed = client.perform(() -> client.connection.setCompleted(addedTask.getId(), true));
+            completed.expectTasks("Existing", "Edited", "Other client's task", "Concurrent edit addition",
+                    "Concurrent completion addition");
+            check(service.calls.equals(Arrays.asList("complete", "read")),
+                    "Completion must be followed by an authoritative snapshot.");
+            Task completedTask = completed.tasks.get(1);
+            check(completedTask.isCompleted() && updatedDate.equals(completedTask.getDueDate())
+                            && addedTask.getId().equals(completedTask.getId()),
+                    "Completion must update the selected task and preserve its other fields.");
+            service.afterUpdate = () -> { };
+            Request noDeadline = client.perform(() -> client.connection.update(addedTask.getId(), "Edited", null));
+            check(noDeadline.tasks.get(1).getDueDate() == null && noDeadline.tasks.get(1).isCompleted(),
+                    "Editing must allow clearing a due date while preserving completion.");
+            service.afterCompleted = () -> { };
+            Request reopened = client.perform(() -> client.connection.setCompleted(addedTask.getId(), false));
+            check(!reopened.tasks.get(1).isCompleted(), "Completion must support marking a task unfinished.");
+
+            service.calls.clear();
             service.afterRemove = () -> service.inject("Concurrent addition");
-            client.perform(() -> client.connection.remove("Existing"))
-                    .expectTasks("New", "Other client's task", "Concurrent addition");
+            client.perform(() -> client.connection.remove(service.idFor("Existing")))
+                    .expectTasks("Edited", "Other client's task", "Concurrent edit addition",
+                            "Concurrent completion addition", "Concurrent addition");
             check(service.calls.equals(Arrays.asList("remove", "read")),
                     "Remove must be followed by a full-list fetch.");
 
@@ -78,7 +121,8 @@ public final class TaskClientTest {
             client.perform(client.connection::clear).expectTasks("Added after clear");
             check(service.calls.equals(Arrays.asList("clear", "read")),
                     "Clear must fetch server state rather than assume the list is empty.");
-            check(service.adds.get() == 1 && service.removes.get() == 1 && service.clears.get() == 1,
+            check(service.adds.get() == 1 && service.updates.get() == 2 && service.completions.get() == 2
+                            && service.removes.get() == 1 && service.clears.get() == 1,
                     "Each accepted mutation must run exactly once.");
             client.perform(client.connection::refresh).expectTasks("Added after clear");
             check(lookups.get() == 2, "Even a connected refresh must look up a fresh stub.");
@@ -115,7 +159,7 @@ public final class TaskClientTest {
                 mutationEntered.countDown();
                 awaitRemote(releaseMutation, "Release slow mutation");
             };
-            Request addition = client.start(() -> client.connection.add("One request"));
+            Request addition = client.start(() -> client.connection.add("One request", null));
             await(mutationEntered, "The background mutation must start");
             assertEventThreadResponsive();
             assertBusyRejectsWork(client);
@@ -126,6 +170,70 @@ public final class TaskClientTest {
         } finally {
             releaseLookup.countDown();
             releaseMutation.countDown();
+            client.close();
+        }
+    }
+
+    private static void testAutomaticRefresh() throws Exception {
+        FakeService original = new FakeService("Shared task");
+        FakeService replacement = new FakeService("Restarted server");
+        AtomicInteger lookups = new AtomicInteger();
+        AtomicReference<FakeService> current = new AtomicReference<>(original);
+        Harness client = new Harness(() -> {
+            checkBackgroundThread();
+            lookups.incrementAndGet();
+            return current.get();
+        });
+        try {
+            onEventThread(() -> {
+                check(!client.connection.refreshAutomatically(), "Polling must require an existing connection.");
+                return null;
+            });
+            check(lookups.get() == 0, "Polling must not connect a disconnected client.");
+            client.perform(client.connection::refresh).expectTasks("Shared task");
+            String id = original.idFor("Shared task");
+            original.updateTaskForTest(id, "Changed by another client", LocalDate.of(2031, 2, 3));
+            original.calls.clear();
+            Request poll = client.perform(client.connection::refreshAutomatically);
+            poll.expectTasks("Changed by another client");
+            check(id.equals(poll.tasks.get(0).getId())
+                            && LocalDate.of(2031, 2, 3).equals(poll.tasks.get(0).getDueDate()),
+                    "Polling must receive complete task fields from the authoritative snapshot.");
+            check(original.calls.equals(Arrays.asList("read")) && lookups.get() == 1,
+                    "Polling must reuse the existing stub without looking up or mutating anything.");
+
+            CountDownLatch entered = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            original.beforeRead = () -> {
+                entered.countDown();
+                awaitRemote(release, "Release automatic refresh");
+            };
+            try {
+                Request slowPoll = client.start(client.connection::refreshAutomatically);
+                await(entered, "The automatic refresh must start off the EDT");
+                assertEventThreadResponsive();
+                assertBusyRejectsWork(client);
+                release.countDown();
+                client.await(slowPoll).expectTasks("Changed by another client");
+            } finally {
+                release.countDown();
+            }
+
+            original.beforeRead = () -> {
+                throw new RemoteException("Expected polling failure");
+            };
+            Request failedPoll = client.perform(client.connection::refreshAutomatically);
+            check(!failedPoll.connected && failedPoll.tasks == null && failedPoll.error == null,
+                    "A failed poll must disconnect without delivering a modal failure callback.");
+            int readsAfterFailure = original.reads.get();
+            assertDisconnectedRejectsMutations(client);
+            check(lookups.get() == 1 && original.reads.get() == readsAfterFailure,
+                    "A failed poll must stop polling without automatically reconnecting.");
+            current.set(replacement);
+            client.perform(client.connection::refresh).expectTasks("Restarted server");
+            client.perform(client.connection::refreshAutomatically).expectTasks("Restarted server");
+            check(lookups.get() == 2, "Manual refresh must reconnect; subsequent polls must reuse that new stub.");
+        } finally {
             client.close();
         }
     }
@@ -149,11 +257,12 @@ public final class TaskClientTest {
             original.beforeRemove = () -> {
                 throw new RemoteException("Server stopped");
             };
-            client.perform(() -> client.connection.remove("Old server")).expectFailure(false, "may already");
+            client.perform(() -> client.connection.remove(original.idFor("Old server")))
+                    .expectFailure(false, "may already");
             assertDisconnectedRejectsMutations(client);
             current.set(replacement);
             client.perform(client.connection::refresh).expectTasks("New server");
-            client.perform(() -> client.connection.add("Recovered")).expectTasks("New server", "Recovered");
+            client.perform(() -> client.connection.add("Recovered", null)).expectTasks("New server", "Recovered");
             check(lookups.get() == 3, "Only explicit refreshes may look up replacement stubs.");
             check(original.removes.get() == 1 && original.adds.get() == 0 && replacement.adds.get() == 1,
                     "After recovery, mutations must use the replacement service.");
@@ -163,29 +272,67 @@ public final class TaskClientTest {
     }
 
     private static void testUncertainMutationIsNeverRetried() throws Exception {
-        FakeService service = new FakeService();
-        AtomicInteger lookups = new AtomicInteger();
-        Harness client = new Harness(() -> {
-            checkBackgroundThread();
-            lookups.incrementAndGet();
-            return service;
-        });
-        try {
-            client.perform(client.connection::refresh).expectTasks();
-            service.afterAdd = () -> {
-                throw new RemoteException("Applied, but the response was lost");
-            };
-            client.perform(() -> client.connection.add("Apply once")).expectFailure(false, "may already");
-            check(service.snapshot().equals(Arrays.asList("Apply once")), "The fake server must have applied the task.");
-            check(service.adds.get() == 1 && service.reads.get() == 1 && lookups.get() == 1,
-                    "An uncertain mutation must never be retried or followed by an automatic reconnect.");
-            assertDisconnectedRejectsMutations(client);
-            service.afterAdd = () -> { };
-            client.perform(client.connection::refresh).expectTasks("Apply once");
-            check(service.adds.get() == 1 && lookups.get() == 2,
-                    "Manual refresh must inspect state without repeating the previous mutation.");
-        } finally {
-            client.close();
+        for (String operation : Arrays.asList("add", "update", "complete", "remove", "clear")) {
+            FakeService service = new FakeService("Existing");
+            AtomicInteger lookups = new AtomicInteger();
+            Harness client = new Harness(() -> {
+                checkBackgroundThread();
+                lookups.incrementAndGet();
+                return service;
+            });
+            try {
+                client.perform(client.connection::refresh).expectTasks("Existing");
+                String id = service.idFor("Existing");
+                RemoteAction lostResponse = () -> {
+                    throw new RemoteException("Applied " + operation + ", but its response was lost");
+                };
+                BooleanSupplier action;
+                String[] expectedDescriptions;
+                switch (operation) {
+                    case "add":
+                        service.afterAdd = lostResponse;
+                        action = () -> client.connection.add("Apply once", null);
+                        expectedDescriptions = new String[] {"Existing", "Apply once"};
+                        break;
+                    case "update":
+                        service.afterUpdate = lostResponse;
+                        action = () -> client.connection.update(id, "Edited once", null);
+                        expectedDescriptions = new String[] {"Edited once"};
+                        break;
+                    case "complete":
+                        service.afterCompleted = lostResponse;
+                        action = () -> client.connection.setCompleted(id, true);
+                        expectedDescriptions = new String[] {"Existing"};
+                        break;
+                    case "remove":
+                        service.afterRemove = lostResponse;
+                        action = () -> client.connection.remove(id);
+                        expectedDescriptions = new String[0];
+                        break;
+                    case "clear":
+                        service.afterClear = lostResponse;
+                        action = client.connection::clear;
+                        expectedDescriptions = new String[0];
+                        break;
+                    default:
+                        throw new AssertionError("Unknown mutation test: " + operation);
+                }
+                service.calls.clear();
+                client.perform(action).expectFailure(false, "may already");
+                check(descriptions(service.snapshot()).equals(Arrays.asList(expectedDescriptions)),
+                        "The fake server must have applied " + operation + " exactly once.");
+                check(service.calls.equals(Arrays.asList(operation)) && service.reads.get() == 1 && lookups.get() == 1,
+                        "An uncertain mutation must never be retried or followed by automatic reconnection.");
+                if ("complete".equals(operation)) {
+                    check(service.snapshot().get(0).isCompleted(), "The completion must have reached the fake server.");
+                }
+                assertDisconnectedRejectsMutations(client);
+                client.perform(client.connection::refresh).expectTasks(expectedDescriptions);
+                check(lookups.get() == 2 && service.calls.equals(Arrays.asList(operation, "read")),
+                        "Manual refresh must inspect state without repeating the mutation.");
+            } finally {
+                client.close();
+            }
         }
     }
 
@@ -197,15 +344,42 @@ public final class TaskClientTest {
             service.beforeRead = () -> {
                 throw new RemoteException("Snapshot response failed");
             };
-            client.perform(() -> client.connection.add("Committed")).expectFailure(false, "may already");
+            client.perform(() -> client.connection.add("Committed", null)).expectFailure(false, "may already");
             check(service.adds.get() == 1 && service.reads.get() == 2,
                     "A successful mutation must attempt exactly one authoritative snapshot.");
-            check(service.snapshot().equals(Arrays.asList("Committed")),
+            check(descriptions(service.snapshot()).equals(Arrays.asList("Committed")),
                     "A snapshot failure must not undo or retry the successful mutation.");
             assertDisconnectedRejectsMutations(client);
             service.beforeRead = () -> { };
             client.perform(client.connection::refresh).expectTasks("Committed");
             check(service.adds.get() == 1, "Recovery must not replay a mutation after a snapshot failure.");
+        } finally {
+            client.close();
+        }
+    }
+
+    private static void testPersistenceFailureBeforeMutation() throws Exception {
+        FakeService service = new FakeService("Already saved");
+        AtomicInteger lookups = new AtomicInteger();
+        Harness client = new Harness(() -> {
+            lookups.incrementAndGet();
+            return service;
+        });
+        try {
+            client.perform(client.connection::refresh).expectTasks("Already saved");
+            service.calls.clear();
+            service.beforeAdd = () -> {
+                throw new RemoteException("Could not save tasks; no changes were applied.");
+            };
+            client.perform(() -> client.connection.add("Not saved", null)).expectFailure(false, "may already");
+            check(descriptions(service.snapshot()).equals(Arrays.asList("Already saved")),
+                    "A failed save must not fabricate an added task in the client or server snapshot.");
+            check(service.calls.equals(Arrays.asList("add")) && lookups.get() == 1,
+                    "The client must not retry a mutation after a persistence failure.");
+            assertDisconnectedRejectsMutations(client);
+            client.perform(client.connection::refresh).expectTasks("Already saved");
+            check(service.adds.get() == 1 && lookups.get() == 2,
+                    "Manual refresh must recover saved state without reapplying the failed mutation.");
         } finally {
             client.close();
         }
@@ -223,15 +397,25 @@ public final class TaskClientTest {
             service.beforeAdd = () -> {
                 throw new IllegalArgumentException("A task must not be blank");
             };
-            client.perform(() -> client.connection.add(" ")).expectFailure(true, "Task rejected:");
+            client.perform(() -> client.connection.add(" ", null)).expectFailure(true, "Task rejected:");
             service.beforeAdd = () -> {
                 throw new IllegalStateException("The task list is full");
             };
-            client.perform(() -> client.connection.add("Overflow")).expectFailure(true, "Task rejected:");
+            client.perform(() -> client.connection.add("Overflow", null)).expectFailure(true, "Task rejected:");
             check(service.snapshot().isEmpty() && service.reads.get() == 1,
                     "Rejected mutations must not update state or fetch a misleading snapshot.");
             service.beforeAdd = () -> { };
-            client.perform(() -> client.connection.add("Valid")).expectTasks("Valid");
+            client.perform(() -> client.connection.add("Valid", null)).expectTasks("Valid");
+            String id = service.idFor("Valid");
+            service.beforeUpdate = () -> {
+                throw new IllegalArgumentException("The new description is invalid");
+            };
+            client.perform(() -> client.connection.update(id, " ", null)).expectFailure(true, "Task rejected:");
+            client.perform(() -> client.connection.setCompleted("missing-id", true))
+                    .expectFailure(true, "Task rejected:");
+            client.perform(() -> client.connection.remove("missing-id")).expectFailure(true, "Task rejected:");
+            service.beforeUpdate = () -> { };
+            client.perform(() -> client.connection.update(id, "Still connected", null)).expectTasks("Still connected");
             check(lookups.get() == 1, "Validation errors must retain the current working connection.");
         } finally {
             client.close();
@@ -260,9 +444,12 @@ public final class TaskClientTest {
             client.close();
             onEventThread(() -> {
                 check(!client.connection.refresh(), "A closed client must reject refresh.");
-                check(!client.connection.add("Closed"), "A closed client must reject add.");
+                check(!client.connection.add("Closed", null), "A closed client must reject add.");
+                check(!client.connection.update("id", "Closed", null), "A closed client must reject edit.");
+                check(!client.connection.setCompleted("id", true), "A closed client must reject completion.");
                 check(!client.connection.remove("Closed"), "A closed client must reject remove.");
                 check(!client.connection.clear(), "A closed client must reject clear.");
+                check(!client.connection.refreshAutomatically(), "A closed client must reject automatic refresh.");
                 return null;
             });
             release.countDown();
@@ -289,7 +476,10 @@ public final class TaskClientTest {
         Harness client = new Harness(FakeService::new);
         try {
             expectEventThreadFailure(client.connection::refresh);
-            expectEventThreadFailure(() -> client.connection.add("Wrong thread"));
+            expectEventThreadFailure(client.connection::refreshAutomatically);
+            expectEventThreadFailure(() -> client.connection.add("Wrong thread", null));
+            expectEventThreadFailure(() -> client.connection.update("id", "Wrong thread", null));
+            expectEventThreadFailure(() -> client.connection.setCompleted("id", true));
             expectEventThreadFailure(() -> client.connection.remove("Wrong thread"));
             expectEventThreadFailure(client.connection::clear);
             try {
@@ -400,7 +590,10 @@ public final class TaskClientTest {
     private static void assertBusyRejectsWork(Harness client) throws Exception {
         onEventThread(() -> {
             check(!client.connection.refresh(), "Only one refresh may be active.");
-            check(!client.connection.add("Busy"), "Add must be rejected while busy.");
+            check(!client.connection.refreshAutomatically(), "Automatic refresh must not overlap another operation.");
+            check(!client.connection.add("Busy", null), "Add must be rejected while busy.");
+            check(!client.connection.update("id", "Busy", null), "Edit must be rejected while busy.");
+            check(!client.connection.setCompleted("id", true), "Completion must be rejected while busy.");
             check(!client.connection.remove("Busy"), "Remove must be rejected while busy.");
             check(!client.connection.clear(), "Clear must be rejected while busy.");
             return null;
@@ -409,9 +602,12 @@ public final class TaskClientTest {
 
     private static void assertDisconnectedRejectsMutations(Harness client) throws Exception {
         onEventThread(() -> {
-            check(!client.connection.add("Disconnected"), "Disconnected add must be rejected.");
+            check(!client.connection.add("Disconnected", null), "Disconnected add must be rejected.");
+            check(!client.connection.update("id", "Disconnected", null), "Disconnected edit must be rejected.");
+            check(!client.connection.setCompleted("id", true), "Disconnected completion must be rejected.");
             check(!client.connection.remove("Disconnected"), "Disconnected remove must be rejected.");
             check(!client.connection.clear(), "Disconnected clear must be rejected.");
+            check(!client.connection.refreshAutomatically(), "Disconnected clients must not poll or reconnect automatically.");
             return null;
         });
     }
@@ -497,6 +693,14 @@ public final class TaskClientTest {
         }
     }
 
+    private static List<String> descriptions(List<Task> tasks) {
+        ArrayList<String> descriptions = new ArrayList<>();
+        for (Task task : tasks) {
+            descriptions.add(task.getDescription());
+        }
+        return descriptions;
+    }
+
     private static final class Harness {
         private final RecordingListener listener = new RecordingListener();
         private final TaskClientConnection connection;
@@ -537,12 +741,12 @@ public final class TaskClientTest {
     private static final class Request {
         private final CountDownLatch done = new CountDownLatch(1);
         private boolean started;
-        private ArrayList<String> tasks;
+        private ArrayList<Task> tasks;
         private String error;
         private boolean connected;
 
         void expectTasks(String... expected) {
-            check(connected && error == null && tasks != null && tasks.equals(Arrays.asList(expected)),
+            check(connected && error == null && tasks != null && descriptions(tasks).equals(Arrays.asList(expected)),
                     "Expected tasks " + Arrays.asList(expected) + "; got " + tasks + ", error=" + error);
         }
 
@@ -582,7 +786,7 @@ public final class TaskClientTest {
         }
 
         @Override
-        public void tasksReceived(ArrayList<String> tasks) {
+        public void tasksReceived(ArrayList<Task> tasks) {
             callback();
             current.tasks = new ArrayList<>(tasks);
             onReceived.run();
@@ -614,49 +818,109 @@ public final class TaskClientTest {
     }
 
     private static final class FakeService implements TaskManager {
-        private final ArrayList<String> tasks = new ArrayList<>();
+        private final ArrayList<Task> tasks = new ArrayList<>();
         private final List<String> calls = new CopyOnWriteArrayList<>();
         private final AtomicInteger adds = new AtomicInteger();
+        private final AtomicInteger updates = new AtomicInteger();
+        private final AtomicInteger completions = new AtomicInteger();
         private final AtomicInteger removes = new AtomicInteger();
         private final AtomicInteger clears = new AtomicInteger();
         private final AtomicInteger reads = new AtomicInteger();
         private volatile RemoteAction beforeAdd = () -> { };
         private volatile RemoteAction afterAdd = () -> { };
+        private volatile RemoteAction beforeUpdate = () -> { };
+        private volatile RemoteAction afterUpdate = () -> { };
+        private volatile RemoteAction afterCompleted = () -> { };
         private volatile RemoteAction beforeRemove = () -> { };
         private volatile RemoteAction afterRemove = () -> { };
         private volatile RemoteAction afterClear = () -> { };
         private volatile RemoteAction beforeRead = () -> { };
 
         FakeService(String... initialTasks) {
-            tasks.addAll(Arrays.asList(initialTasks));
+            for (String description : initialTasks) {
+                inject(description);
+            }
         }
 
-        synchronized void inject(String task) {
-            tasks.add(task);
+        synchronized void inject(String description) {
+            tasks.add(new Task(UUID.randomUUID().toString(), description, false, null));
         }
 
-        synchronized ArrayList<String> snapshot() {
+        synchronized String idFor(String description) {
+            for (Task task : tasks) {
+                if (description.equals(task.getDescription())) {
+                    return task.getId();
+                }
+            }
+            throw new AssertionError("Missing fake task: " + description);
+        }
+
+        private synchronized int indexOf(String id) {
+            for (int index = 0; index < tasks.size(); index++) {
+                if (tasks.get(index).getId().equals(id)) {
+                    return index;
+                }
+            }
+            throw new IllegalArgumentException("No task with id: " + id);
+        }
+
+        synchronized void updateTaskForTest(String id, String description, LocalDate dueDate) {
+            int index = indexOf(id);
+            Task previous = tasks.get(index);
+            tasks.set(index, new Task(id, description, previous.isCompleted(), dueDate));
+        }
+
+        synchronized ArrayList<Task> snapshot() {
             return new ArrayList<>(tasks);
         }
 
         @Override
-        public void addTask(String task) throws RemoteException {
+        public void addTask(String description, LocalDate dueDate) throws RemoteException {
             checkBackgroundThread();
             adds.incrementAndGet();
             calls.add("add");
             beforeAdd.run();
-            inject(task);
+            synchronized (this) {
+                tasks.add(new Task(UUID.randomUUID().toString(), description, false, dueDate));
+            }
             afterAdd.run();
         }
 
         @Override
-        public void removeTask(String task) throws RemoteException {
+        public void updateTask(String id, String description, LocalDate dueDate) throws RemoteException {
+            checkBackgroundThread();
+            updates.incrementAndGet();
+            calls.add("update");
+            beforeUpdate.run();
+            synchronized (this) {
+                int index = indexOf(id);
+                Task previous = tasks.get(index);
+                tasks.set(index, new Task(id, description, previous.isCompleted(), dueDate));
+            }
+            afterUpdate.run();
+        }
+
+        @Override
+        public void setTaskCompleted(String id, boolean completed) throws RemoteException {
+            checkBackgroundThread();
+            completions.incrementAndGet();
+            calls.add("complete");
+            synchronized (this) {
+                int index = indexOf(id);
+                Task previous = tasks.get(index);
+                tasks.set(index, new Task(id, previous.getDescription(), completed, previous.getDueDate()));
+            }
+            afterCompleted.run();
+        }
+
+        @Override
+        public void removeTask(String id) throws RemoteException {
             checkBackgroundThread();
             removes.incrementAndGet();
             calls.add("remove");
             beforeRemove.run();
             synchronized (this) {
-                tasks.remove(task);
+                tasks.remove(indexOf(id));
             }
             afterRemove.run();
         }
@@ -673,7 +937,7 @@ public final class TaskClientTest {
         }
 
         @Override
-        public ArrayList<String> getAllTasks() throws RemoteException {
+        public ArrayList<Task> getAllTasks() throws RemoteException {
             checkBackgroundThread();
             reads.incrementAndGet();
             calls.add("read");
