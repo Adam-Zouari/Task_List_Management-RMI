@@ -1,0 +1,8 @@
+/out/
+/out-audit/
+*.class
+*.log
+.idea/
+.vscode/
+*.iml
+.DS_Store
