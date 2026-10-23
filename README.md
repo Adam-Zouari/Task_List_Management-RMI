@@ -2,6 +2,10 @@
 
 A small task manager with a Java Swing desktop client and a Java Remote Method Invocation (RMI) server. Add, edit, complete, and remove tasks, set optional due dates, and keep changes across server restarts. Multiple clients share the same list and refresh automatically. The project uses only the Java standard library.
 
+## Demo
+
+https://github.com/user-attachments/assets/7a3920f6-4f91-400e-a4b2-dd21834c3735
+
 ## Requirements
 
 - A **JDK 11 or newer**, with both `java` and `javac` on `PATH`.
