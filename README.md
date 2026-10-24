@@ -175,6 +175,7 @@ Java source files are in `src/`, regression tests are in `tests/`, and the build
 | `src/TaskServer.java` | Parses configuration, starts the registry and service, and handles startup/shutdown. |
 | `src/TaskTransport.java` | Shared connection settings, argument validation, and RMI socket factories. |
 | `src/TaskClient.java` | Swing interface; performs remote work in the background and updates the UI on Swing's event thread. |
+| `src/TaskClientStyle.java` | Shared colors, typography, and control styling for the client and dialogs. |
 | `src/TaskClientConnection.java` | Client connection and remote-operation logic, separate from the Swing interface. |
 | `src/TaskTableModel.java` | Checkbox and task table data, with operations targeted by task ID. |
 | `build.ps1`, `build.sh` | Compile with Java 11 compatibility and strict compiler warnings; optionally run tests. |

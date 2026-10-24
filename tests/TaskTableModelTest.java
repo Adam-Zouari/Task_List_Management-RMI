@@ -1,12 +1,20 @@
+import java.awt.Component;
+import java.awt.Graphics2D;
+import java.awt.font.TextAttribute;
+import java.awt.image.BufferedImage;
 import java.time.LocalDate;
 import java.util.Arrays;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.swing.JCheckBox;
+import javax.swing.JButton;
+import javax.swing.JLabel;
 import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.SwingUtilities;
+import javax.swing.table.TableCellRenderer;
 
-/** Headless checks for table identity, checkbox edits, sorting, and date entry. */
+/** Headless checks for task table styling, identity, checkbox edits, sorting, and date entry. */
 public final class TaskTableModelTest {
     private TaskTableModelTest() {
     }
@@ -14,10 +22,99 @@ public final class TaskTableModelTest {
     public static void main(String[] args) throws Exception {
         SwingUtilities.invokeAndWait(() -> {
             testTable();
+            testTaskRenderers();
+            testPrimaryButtonPainting();
             testDescriptionEditor();
         });
         testDateInput();
         System.out.println("TaskTableModelTest: all checks passed.");
+    }
+
+    private static void testPrimaryButtonPainting() {
+        JButton button = new JButton("Add Task");
+        TaskClientStyle.button(button, true, false);
+        button.setSize(button.getPreferredSize());
+        BufferedImage image = new BufferedImage(button.getWidth(), button.getHeight(), BufferedImage.TYPE_INT_RGB);
+        Graphics2D graphics = image.createGraphics();
+        button.paint(graphics);
+        graphics.dispose();
+        check(image.getRGB(4, 4) == button.getBackground().getRGB(),
+                "The primary button must paint its background so its white label stays visible.");
+        check(!button.getForeground().equals(button.getBackground()), "The primary action needs contrasting text.");
+    }
+
+    private static void testTaskRenderers() {
+        LocalDate today = LocalDate.now();
+        Task open = new Task(UUID.randomUUID().toString(), "Z open", false, null);
+        Task completed = new Task(UUID.randomUUID().toString(), "A completed", true, today.minusDays(2));
+        Task overdue = new Task(UUID.randomUUID().toString(), "M overdue", false, today.minusDays(1));
+        TaskTableModel model = new TaskTableModel((id, value) -> { });
+        model.replaceTasks(Arrays.asList(open, completed, overdue));
+        JTable table = new JTable(model);
+        table.setFont(TaskClientStyle.FONT);
+        table.setAutoCreateRowSorter(true);
+        table.getRowSorter().toggleSortOrder(1);
+        // Renderers must interpret view indices correctly after sorting and moving columns.
+        table.moveColumn(1, 3);
+        int completedRow = table.convertRowIndexToView(1);
+        int overdueRow = table.convertRowIndexToView(2);
+        int openRow = table.convertRowIndexToView(0);
+        int descriptionColumn = table.convertColumnIndexToView(1);
+        int dateColumn = table.convertColumnIndexToView(2);
+        int statusColumn = table.convertColumnIndexToView(3);
+        TaskClient.TaskRenderer text = new TaskClient.TaskRenderer();
+        TaskClient.CompletionRenderer checkbox = new TaskClient.CompletionRenderer();
+
+        Component cell = render(text, table, completedRow, descriptionColumn, false);
+        check(Boolean.TRUE.equals(cell.getFont().getAttributes().get(TextAttribute.STRIKETHROUGH))
+                        && TaskClientStyle.MUTED.equals(cell.getForeground()),
+                "A sorted completed description must be muted and crossed out after moving its column.");
+        cell = render(text, table, completedRow, dateColumn, false);
+        check(!Boolean.TRUE.equals(cell.getFont().getAttributes().get(TextAttribute.STRIKETHROUGH))
+                        && TaskClientStyle.MUTED.equals(cell.getForeground()),
+                "Renderer reuse must not cross out completed due dates.");
+        cell = render(text, table, completedRow, statusColumn, true);
+        check("Completed".equals(((JLabel) cell).getText())
+                        && TaskClientStyle.GREEN.equals(cell.getForeground()),
+                "Completed status must remain recognizable when selected, even with a past due date.");
+        for (int column : new int[] {descriptionColumn, dateColumn, statusColumn}) {
+            cell = render(text, table, overdueRow, column, true);
+            check(TaskClientStyle.RED.equals(cell.getForeground()),
+                    "Overdue text must remain recognizable in a selected row.");
+        }
+        cell = render(text, table, openRow, descriptionColumn, false);
+        check(TaskClientStyle.TEXT.equals(cell.getForeground())
+                        && !Boolean.TRUE.equals(cell.getFont().getAttributes().get(TextAttribute.STRIKETHROUGH)),
+                "Renderer reuse must reset completed/overdue styling for an open task.");
+        cell = render(text, table, openRow, dateColumn, false);
+        check("".equals(((JLabel) cell).getText()), "An absent date must not retain a previous cell's date.");
+
+        for (int row = 0; row < model.getRowCount(); row++) {
+            for (int column = 0; column < model.getColumnCount(); column++) {
+                TableCellRenderer renderer = table.convertColumnIndexToModel(column) == 0
+                        ? checkbox : text;
+                cell = render(renderer, table, row, column, false);
+                check((row % 2 == 0 ? TaskClientStyle.SURFACE : TaskClientStyle.STRIPE).equals(cell.getBackground()),
+                        "Text and checkbox cells must share alternating row backgrounds.");
+                cell = render(renderer, table, row, column, true);
+                check(TaskClientStyle.SELECTION.equals(cell.getBackground()),
+                        "Selection must override striping consistently across text and checkbox cells.");
+            }
+        }
+        table.setEnabled(false);
+        JCheckBox completion = (JCheckBox) render(checkbox, table, completedRow, 0, false);
+        check(completion.isSelected() && !completion.isEnabled(),
+                "Disabled checkboxes must retain the saved completion state.");
+        table.setEnabled(true);
+        completion = (JCheckBox) render(checkbox, table, openRow, 0, false);
+        check(!completion.isSelected() && completion.isEnabled(),
+                "Checkbox renderer reuse must reset both completion and disabled state.");
+    }
+
+    private static Component render(TableCellRenderer renderer, JTable table,
+            int row, int column, boolean selected) {
+        return renderer.getTableCellRendererComponent(table, table.getValueAt(row, column), selected,
+                false, row, column);
     }
 
     private static void testTable() {
