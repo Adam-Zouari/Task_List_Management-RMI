@@ -5,6 +5,7 @@ import java.awt.event.FocusAdapter;
 import java.awt.event.FocusEvent;
 import javax.swing.BorderFactory;
 import javax.swing.JButton;
+import javax.swing.JComponent;
 import javax.swing.UIManager;
 import javax.swing.border.Border;
 import javax.swing.plaf.FontUIResource;
@@ -50,6 +51,7 @@ final class TaskClientStyle {
         UIManager.put("Panel.background", SURFACE);
         UIManager.put("OptionPane.background", SURFACE);
         UIManager.put("Label.foreground", TEXT);
+        UIManager.put("Button.disabledText", MUTED);
         UIManager.put("TextField.foreground", TEXT);
         UIManager.put("TextField.inactiveForeground", MUTED);
         UIManager.put("TextField.inactiveBackground", BACKGROUND);
@@ -77,18 +79,7 @@ final class TaskClientStyle {
         field.setDisabledTextColor(MUTED);
         Runnable update = () -> field.setBorder(BorderFactory.createCompoundBorder(
                 outline(field.hasFocus() ? BLUE : BORDER), BorderFactory.createEmptyBorder(8, 10, 8, 10)));
-        field.addFocusListener(new FocusAdapter() {
-            @Override
-            public void focusGained(FocusEvent event) {
-                update.run();
-            }
-
-            @Override
-            public void focusLost(FocusEvent event) {
-                update.run();
-            }
-        });
-        update.run();
+        updateOnFocus(field, update);
     }
 
     static void button(JButton button, boolean primary, boolean destructive) {
@@ -111,7 +102,11 @@ final class TaskClientStyle {
                     BorderFactory.createEmptyBorder(8, 14, 8, 14)));
         };
         button.getModel().addChangeListener(event -> update.run());
-        button.addFocusListener(new FocusAdapter() {
+        updateOnFocus(button, update);
+    }
+
+    private static void updateOnFocus(JComponent component, Runnable update) {
+        component.addFocusListener(new FocusAdapter() {
             @Override
             public void focusGained(FocusEvent event) {
                 update.run();

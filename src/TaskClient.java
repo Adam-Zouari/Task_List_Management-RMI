@@ -55,7 +55,6 @@ public final class TaskClient extends JFrame {
     private boolean busy;
     private boolean connected;
     private boolean dialogOpen;
-    private boolean addPending;
     private String submittedDescription;
     private String submittedDueText;
     private LocalDate displayedDate;
@@ -128,14 +127,14 @@ public final class TaskClient extends JFrame {
             public void tasksReceived(ArrayList<Task> tasks) {
                 LocalDate today = LocalDate.now();
                 displayTasks(tasks, today);
-                if (addPending) {
+                if (submittedDescription != null) {
                     // A user can keep typing during a request; preserve any new input.
                     if (descriptionField.getText().equals(submittedDescription)
                             && dueDateField.getText().equals(submittedDueText)) {
                         descriptionField.setText("");
                         dueDateField.setText("");
                     }
-                    addPending = false;
+                    submittedDescription = null;
                 }
                 long completed = tasks.stream().filter(Task::isCompleted).count();
                 long overdue = tasks.stream().filter(task -> task.isOverdue(today)).count();
@@ -145,7 +144,7 @@ public final class TaskClient extends JFrame {
 
             @Override
             public void failed(String message) {
-                addPending = false;
+                submittedDescription = null;
                 showMessage(message, "Task Manager", JOptionPane.ERROR_MESSAGE);
             }
 
@@ -331,7 +330,6 @@ public final class TaskClient extends JFrame {
             if (connection.add(description, dueDate)) {
                 submittedDescription = originalText;
                 submittedDueText = originalDate;
-                addPending = true;
             }
         } catch (IllegalArgumentException e) {
             showMessage(e.getMessage(), "Invalid task", JOptionPane.WARNING_MESSAGE);
@@ -566,7 +564,7 @@ public final class TaskClient extends JFrame {
         }
     }
 
-    private static final class HeaderRenderer implements TableCellRenderer {
+    static final class HeaderRenderer implements TableCellRenderer {
         private final TableCellRenderer delegate;
 
         HeaderRenderer(TableCellRenderer delegate) {
@@ -582,10 +580,12 @@ public final class TaskClient extends JFrame {
             component.setBackground(TaskClientStyle.BACKGROUND);
             if (component instanceof JLabel) {
                 JLabel label = (JLabel) component;
-                label.setHorizontalAlignment(table.convertColumnIndexToModel(column) == 0 ? JLabel.CENTER : JLabel.LEFT);
+                boolean completionColumn = table.convertColumnIndexToModel(column) == 0;
+                int padding = completionColumn ? 4 : 12;
+                label.setHorizontalAlignment(completionColumn ? JLabel.CENTER : JLabel.LEFT);
                 label.setBorder(BorderFactory.createCompoundBorder(
                         BorderFactory.createMatteBorder(0, 0, 1, 0, TaskClientStyle.BORDER),
-                        BorderFactory.createEmptyBorder(0, 12, 0, 12)));
+                        BorderFactory.createEmptyBorder(0, padding, 0, padding)));
             }
             return component;
         }

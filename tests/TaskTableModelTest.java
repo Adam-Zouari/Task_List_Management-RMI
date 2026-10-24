@@ -1,4 +1,5 @@
 import java.awt.Component;
+import java.awt.Color;
 import java.awt.Graphics2D;
 import java.awt.font.TextAttribute;
 import java.awt.image.BufferedImage;
@@ -8,6 +9,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.swing.JCheckBox;
 import javax.swing.JButton;
+import javax.swing.Icon;
 import javax.swing.JLabel;
 import javax.swing.JTable;
 import javax.swing.JTextArea;
@@ -24,6 +26,7 @@ public final class TaskTableModelTest {
             testTable();
             testTaskRenderers();
             testPrimaryButtonPainting();
+            testTableHeaders();
             testDescriptionEditor();
         });
         testDateInput();
@@ -32,15 +35,54 @@ public final class TaskTableModelTest {
 
     private static void testPrimaryButtonPainting() {
         JButton button = new JButton("Add Task");
+        // Match startup: the button's UI delegate exists before shared defaults are installed.
+        TaskClientStyle.install();
         TaskClientStyle.button(button, true, false);
         button.setSize(button.getPreferredSize());
+        checkButtonPainting(button, TaskClientStyle.SURFACE);
+        button.setEnabled(false);
+        checkButtonPainting(button, TaskClientStyle.MUTED);
+        button.setEnabled(true);
+        checkButtonPainting(button, TaskClientStyle.SURFACE);
+    }
+
+    private static void checkButtonPainting(JButton button, Color expectedText) {
         BufferedImage image = new BufferedImage(button.getWidth(), button.getHeight(), BufferedImage.TYPE_INT_RGB);
         Graphics2D graphics = image.createGraphics();
         button.paint(graphics);
         graphics.dispose();
         check(image.getRGB(4, 4) == button.getBackground().getRGB(),
                 "The primary button must paint its background so its white label stays visible.");
-        check(!button.getForeground().equals(button.getBackground()), "The primary action needs contrasting text.");
+        boolean textPainted = false;
+        for (int x = 3; x < image.getWidth() - 3; x++) {
+            for (int y = 3; y < image.getHeight() - 3; y++) {
+                textPainted |= image.getRGB(x, y) == expectedText.getRGB();
+            }
+        }
+        check(textPainted, "Enabled and disabled button labels must actually paint in their readable theme colors.");
+    }
+
+    private static void testTableHeaders() {
+        JTable table = new JTable(new TaskTableModel((id, value) -> { }));
+        table.setAutoCreateRowSorter(true);
+        table.getRowSorter().toggleSortOrder(0);
+        TableCellRenderer delegate = table.getTableHeader().getDefaultRenderer();
+        JLabel nativeHeader = (JLabel) delegate.getTableCellRendererComponent(table, "Done", false, false, -1, 0);
+        Icon sortIcon = nativeHeader.getIcon();
+        check(sortIcon != null, "The sorted checkbox header must have a sort indicator.");
+        TaskClient.HeaderRenderer renderer = new TaskClient.HeaderRenderer(delegate);
+        JLabel done = (JLabel) renderer.getTableCellRendererComponent(table, "Done", false, false, -1, 0);
+        check(done.getPreferredSize().width <= 68,
+                "The sorted Done label and indicator must fit within the narrow checkbox column.");
+        check(done.getHorizontalAlignment() == JLabel.CENTER && done.getIcon() == sortIcon,
+                "Styling must retain the centered Done label and its native sort indicator.");
+        table.moveColumn(0, 3);
+        done = (JLabel) renderer.getTableCellRendererComponent(table, "Done", false, false, -1, 3);
+        check(done.getHorizontalAlignment() == JLabel.CENTER && done.getIcon() == sortIcon,
+                "The checkbox header must retain alignment and sorting after its column moves.");
+        JLabel task = (JLabel) renderer.getTableCellRendererComponent(table, "Task", false, false, -1, 0);
+        check(task.getHorizontalAlignment() == JLabel.LEFT && task.getIcon() == null,
+                "Other headers remain left aligned and must not retain a reused sort icon.");
     }
 
     private static void testTaskRenderers() {

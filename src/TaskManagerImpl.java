@@ -11,7 +11,6 @@ import java.util.UUID;
 
 /** Thread-safe task service; persistent mutations are saved before memory is changed. */
 public final class TaskManagerImpl implements TaskManager, AutoCloseable {
-    public static final int MAX_TASK_LENGTH = Task.MAX_DESCRIPTION_LENGTH;
     public static final int MAX_TASKS = 10000;
     private ArrayList<Task> tasks;
     private final TaskStore store;
